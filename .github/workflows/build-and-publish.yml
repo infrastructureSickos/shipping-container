@@ -1,0 +1,122 @@
+name: Build and Publish Mod
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Build
+        run: ./gradlew build
+
+      - name: Read gradle.properties
+        id: props
+        run: |
+          modrinth_id=$(grep '^modrinth_id=' gradle.properties | cut -d= -f2)
+          mod_version=$(grep '^mod_version=' gradle.properties | cut -d= -f2)
+          game_versions=$(grep '^modrinth_game_versions=' gradle.properties | cut -d= -f2)
+          echo "modrinth_id=$modrinth_id" >> "$GITHUB_OUTPUT"
+          echo "mod_version=$mod_version" >> "$GITHUB_OUTPUT"
+          echo "game_versions=$game_versions" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to Modrinth
+        id: modrinth
+        run: |
+          JAR=$(ls build/libs/shipping_container-*.jar | grep -v sources | head -1)
+          echo "Publishing $JAR"
+          GAME_VERSIONS_JSON=$(echo "${{ steps.props.outputs.game_versions }}" | python3 -c "import sys,json; v=[x.strip() for x in sys.stdin.read().split(',') if x.strip()]; print(json.dumps(v))")
+          RESPONSE=$(curl -sf -X POST "https://api.modrinth.com/v2/version" \
+            -H "Authorization: ${{ secrets.MODRINTH_API_TOKEN }}" \
+            -F "data={\"project_id\":\"${{ steps.props.outputs.modrinth_id }}\",\"name\":\"${{ steps.props.outputs.mod_version }}\",\"version_number\":\"${{ steps.props.outputs.mod_version }}\",\"game_versions\":${GAME_VERSIONS_JSON},\"loaders\":[\"forge\"],\"version_type\":\"release\",\"dependencies\":[]}" \
+            -F "files=@$JAR")
+          echo "modrinth_version_id=$(echo $RESPONSE | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')" >> "$GITHUB_OUTPUT"
+
+      - name: Update modpack manifest
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          MODRINTH_VERSION_ID: ${{ steps.modrinth.outputs.modrinth_version_id }}
+          MODRINTH_PROJECT_ID: ${{ steps.props.outputs.modrinth_id }}
+          MOD_VERSION: ${{ steps.props.outputs.mod_version }}
+        run: |
+          git config --global user.email "ci@infrastructuresickos.github"
+          git config --global user.name "InfrastructureSickos CI"
+          git clone "https://x-access-token:${GH_PAT}@github.com/brooswit/minecraft-modpack.git" modpack-repo
+          cd modpack-repo
+
+          python3 - <<'EOF'
+          import json, os, glob
+
+          version_id = os.environ["MODRINTH_VERSION_ID"]
+          project_id = os.environ["MODRINTH_PROJECT_ID"]
+          mod_version = os.environ["MOD_VERSION"]
+
+          # Try manifest.json first, fall back to mods.json or any JSON manifest
+          candidates = ["manifest.json", "mods.json", "mods-list.json"]
+          path = None
+          for c in candidates:
+              if os.path.exists(c):
+                  path = c
+                  break
+
+          if path is None:
+              # Create a new manifest
+              path = "manifest.json"
+              data = {"mods": []}
+          else:
+              with open(path) as f:
+                  data = json.load(f)
+
+          # Handle both list-of-mods and {mods: [...]} formats
+          mods = data if isinstance(data, list) else data.get("mods", data)
+
+          found = False
+          for mod in mods if isinstance(mods, list) else []:
+              if mod.get("modrinth_project_id") == project_id or mod.get("name") == "shipping-container":
+                  mod["version_id"] = version_id
+                  mod["version"] = mod_version
+                  found = True
+                  break
+
+          if not found:
+              entry = {
+                  "name": "shipping-container",
+                  "modrinth_project_id": project_id,
+                  "version_id": version_id,
+                  "version": mod_version
+              }
+              if isinstance(mods, list):
+                  mods.append(entry)
+              else:
+                  data["mods"] = [entry]
+
+          with open(path, "w") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+
+          print(f"Updated {path}: shipping-container -> {version_id} ({mod_version})")
+          EOF
+
+          git add -A
+          git diff --cached --quiet || git commit -m "chore: update shipping-container to ${MOD_VERSION}
+
+Co-Authored-By: Paperclip <noreply@paperclip.ing>"
+          git push
